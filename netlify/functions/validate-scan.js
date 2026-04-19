@@ -1,6 +1,6 @@
 const { createClient } = require('@supabase/supabase-js');
 const { isIPv4 } = require('net');
-const IPCIDR = require('ip-cidr-check'); // For IP-CIDR matching
+const IPCIDR = require('ip-cidr'); // For IP-CIDR matching
 const pointInPolygon = require('point-in-polygon'); // For geofence checking
 
 // Initialize Supabase client for server-side
