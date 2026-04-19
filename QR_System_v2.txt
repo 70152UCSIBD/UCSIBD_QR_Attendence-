@@ -1,0 +1,217 @@
+Faculty Attendance System
+QR-Based Mobile PWA — System Specification
+Version 2.0  |  UCSI University Bangladesh  |  Assistant Registrar (IT)
+
+
+What changed in v2.0
+This revision incorporates findings from the cross-departmental staff review meeting. Nine issues were identified covering GPS accuracy, schedule ownership, data compliance, audit integrity, and operational resilience. All four original architecture pivots are retained; five new pivots are added.
+
+1. System Overview
+The Faculty Attendance System is a lightweight, mobile-first Progressive Web App (PWA) designed to track university class attendance via static QR codes. It operates on a serverless Jamstack architecture using Next.js, Supabase, and Netlify Functions, ensuring high scalability and low maintenance overhead.
+
+1.1 Core Workflow
+1. Authentication: Faculty log in on their mobile device using a 6-digit One-Time Password sent to their university email (@ucsi.edu.bd domain only). A persistent session is stored in the PWA's local storage.
+2. Contextual Scanning: The faculty member taps "Scan Attendance." The PWA requests Camera permissions and simultaneously captures HTML5 Geolocation (GPS coordinates).
+3. QR Capture: The teacher scans the static QR placard in the classroom, which contains a unique qr_token identifying the room.
+4. Serverless Validation: The frontend packages the User ID, Room Token, Timestamp, GPS data, and a Session Start Marker, then POSTs to the Netlify validation function.
+5. The Validation Engine runs checks in order — see Section 4 for full logic.
+6. Resolution: Attendance is recorded as verified, flagged, or manual_override. Flagged records enter a defined review queue with a 24-hour SLA (see Section 5.3).
+7. Session Close: A minimum session duration of 20 minutes is enforced. A second background ping at T+20 minutes confirms the faculty member remained on-site, creating an audit record that a class actually took place — not merely that the faculty member was near the room at the start.
+
+1.2 Identity and Role Management (RBAC)
+The system uses Role-Based Access Control managed via Supabase. Three roles are defined:
+• Standard Faculty — access to the mobile QR scanner and personal scan history only.
+• Administrators (Department Coordinators) — desktop dashboard with real-time analytics, schedule management, Override PIN generation, and exception log review.
+• Super Admins (IT) — global configuration including campus IP subnets, QR token mapping, geofence polygon management, and role assignments.
+
+
+2. Development Execution Plan
+The build process is divided into six phases. Security and validation logic must be established before any user interface is deployed.
+
+Phase 1 — Infrastructure and Authentication
+• Provision the Supabase project and construct the PostgreSQL relational tables: profiles, classrooms, schedules, attendance_logs, override_pins, and flagged_review_queue.
+• Configure Supabase Auth with email OTP (no magic links). Restrict account creation to @ucsi.edu.bd domain.
+• Prepare the staff data consent form (in coordination with Legal) to be signed before any GPS data is collected. No GPS coordinates may be stored until consent is on file.
+
+Phase 2 — Role and Security Rules
+• Implement Row Level Security (RLS) policies so faculty can only read and write their own records.
+• Admins can read all records within their department. Super Admins have global read-write access.
+• All GPS coordinate columns must be encrypted at rest using Supabase's pgcrypto extension.
+
+Phase 3 — The Mobile Scanner Frontend (PWA)
+• Build the React/Next.js frontend with Tailwind CSS.
+• Integrate the HTML5 QR scanner component and Geolocation API.
+• Implement the Session Close ping at T+20 minutes (background fetch with service worker).
+• Build the manual fallback flow: if camera or GPS is unavailable (e.g., dead battery handled via a secondary device), faculty can enter a Room Code manually. This submission is flagged as manual_entry and routed to the admin review queue.
+• Configure the PWA web manifest and service workers for offline caching and home-screen installation.
+
+Phase 4 — The Validation Engine (Netlify Functions)
+• Write the /api/validate-scan serverless function with fallback OR logic (campus WiFi IP or GPS).
+• Replace the fixed 40m GPS radius with building-level polygon geofences stored in the classrooms table. Each classroom is assigned to a building polygon rather than a point radius, accommodating GPS drift in concrete structures.
+• Write /api/session-close to process the T+20 attendance confirmation ping.
+• Write /api/generate-pin with configurable expiry (default 10 minutes, adjustable per department up to 30 minutes).
+
+Phase 5 — Administrative Tools
+• Build the desktop dashboard for Admins with real-time attendance logs, exception management, and schedule import.
+• Build the Override PIN generator with configurable expiry window.
+• Build the Flagged Review Queue interface with 24-hour SLA countdown indicators.
+• Build the Schedule Sync API endpoint for the Registrar's office to push schedule updates same-day.
+
+Phase 6 — MIS Integration and Reporting
+• Build a scheduled export job that pushes finalized daily attendance records to the university MIS system in the agreed format (CSV or REST).
+• Build the Data Audit Log dashboard for Super Admins showing all GPS data access events for compliance purposes.
+
+
+3. Database Schema
+The following tables are required. Row Level Security must be enabled on all tables before any data is written.
+
+3.1 Core Tables
+• profiles — links to Supabase Auth UUID. Columns: email, full_name, role (enum: faculty, admin, super_admin), gps_consent_signed (boolean), gps_consent_date (timestamp).
+• classrooms — Columns: id, room_name, qr_token (unique), building_id (fk), geofence_polygon (JSON array of lat/lng vertices), latitude, longitude (centroid, used as fallback).
+• buildings — Columns: id, name, campus_wifi_subnets (array of CIDR strings). Separating building from classroom allows polygon geofences to cover entire structures.
+• schedules — Columns: id, faculty_id (fk), classroom_id (fk), start_time, end_time, day_of_week, effective_from, effective_until, updated_by, updated_at.
+• attendance_logs — Columns: id, faculty_id (fk), classroom_id (fk), scanned_at (timestamp), session_closed_at (timestamp, nullable), status (enum: verified, flagged, manual_override, manual_entry), validation_method (enum: ip, gps, pin, manual), ip_address (encrypted), gps_lat (encrypted), gps_lng (encrypted).
+• override_pins — Columns: id, generated_by (fk to profiles), classroom_id (fk), pin_hash, expires_at, used_at (nullable), max_duration_minutes.
+• flagged_review_queue — Columns: id, attendance_log_id (fk), assigned_to (fk to profiles), created_at, resolved_at, resolution_note, sla_deadline (auto-set to created_at + 24 hours).
+
+
+4. Validation Engine Logic
+The /api/validate-scan Netlify Function executes the following checks in strict order:
+
+8. Schedule Check — Query Supabase to confirm the faculty member is scheduled in the room associated with the scanned qr_token at the current timestamp (+/- 15 minutes). If this check fails, reject immediately. No further checks are performed.
+9. Consent Check — Confirm that gps_consent_signed is true for this faculty member before reading or storing any GPS data from the payload.
+10. Context Check (Fallback OR Logic) — Evaluate the environment using two independent methods:
+a. Network check: does the request origin IP match any CIDR subnet in the building's campus_wifi_subnets array?
+b. Location check: do the payload GPS coordinates fall inside the classroom's building-level polygon geofence? (Point-in-polygon algorithm replaces the previous 40m Haversine radius.)
+11. Resolution:
+c. If Schedule = TRUE AND (Network = TRUE OR Location = TRUE): write to attendance_logs with status 'verified'. Return success.
+d. If Schedule = TRUE AND (Network = FALSE AND Location = FALSE): write with status 'flagged'. Return success to the user but add to the flagged_review_queue with 24-hour SLA.
+12. Session Close (T+20 minutes) — A second background ping from the faculty member's device confirms continued presence. This updates session_closed_at in attendance_logs. Records with no session close event after 30 minutes are automatically flagged for review.
+
+
+5. Architecture Pivots
+The following pivots document all significant design decisions from v1.0 and new decisions introduced in v2.0.
+
+Original Pivots (Retained from v1.0)
+
+Pivot 1 — OTP Login Replaces Magic Links
+Magic links opened in isolated browser sandboxes on mobile, preventing the PWA from registering the authentication token. 6-digit OTPs entered directly into the installed PWA resolved this.
+
+Pivot 2 — Fallback OR Validation Logic
+Requiring both GPS and campus WiFi simultaneously caused false negatives in basement halls and during cellular auto-switching. The engine was rewritten to accept either a valid campus IP or valid GPS coordinates, provided the schedule check passes.
+
+Pivot 3 — Decoupling from Microsoft 365
+M365 Active Directory via OAuth 2.0 introduced enterprise API overhead incompatible with serverless cold-start constraints. The system migrated entirely to Supabase Auth, centralising authentication and database queries.
+
+Pivot 4 — Override PIN for Ad-Hoc Classes
+Classes frequently relocate to spaces without physical QR placards. Administrators can generate a dynamic PIN from the dashboard, allowing verified check-in without a physical QR code.
+
+New Pivots (Added in v2.0)
+
+Pivot 5 — Polygon Geofencing Replaces Point Radius
+Problem: The original 40-meter Haversine radius geofence was derived from ideal outdoor GPS accuracy. In practice, GPS in dense concrete university buildings drifts 60-80 meters. Faculty physically inside the correct room were being rejected or flagged.
+Solution: Each building is assigned a polygon geofence (a JSON array of lat/lng vertices stored in the buildings table). Validation uses a point-in-polygon algorithm instead of a radius check. Polygons are calibrated per building by IT during setup and can be adjusted without a code deployment.
+
+Pivot 6 — Session Duration Confirmation
+Problem: The original design proved only that a faculty member's device was near a classroom at a single moment. A faculty member could scan and leave immediately, and the system would record a verified attendance. This concern was raised by Student Affairs, who handle complaints about classes that exist on paper but did not meaningfully take place.
+Solution: A second background ping is sent by the PWA at T+20 minutes after the initial scan. The ping is handled by the /api/session-close endpoint, which updates the session_closed_at field. Attendance records with no session close event are automatically flagged after 30 minutes for administrative review.
+
+Pivot 7 — Schedule Ownership and Same-Day Sync
+Problem: The system validates every scan against the schedules table. However, no ownership or update SLA was defined for this table. Mid-semester reschedules, make-up classes, and exam adjustments were not accounted for, meaning valid scans could be rejected if the database lagged behind the real schedule.
+Solution: The Registrar's office is formally assigned ownership of the schedules table. A Schedule Sync API endpoint (/api/sync-schedules) is provided for the Registrar to push updates directly from the university MIS. Updates must be reflected in the system within the same business day. The updated_by and updated_at columns on the schedules table create an audit trail for all changes.
+
+Pivot 8 — Configurable Override PIN Expiry and Delegation
+Problem: The original 5-minute PIN window was a security default that did not account for class sizes. For cohorts of 50+ students, the last several students routinely missed the window. Additionally, PIN generation was restricted to Admins, creating a single point of failure when the relevant Admin was unavailable.
+Solution: PIN expiry is now configurable per department (default: 10 minutes, maximum: 30 minutes). Department Coordinators can pre-delegate PIN generation rights to a nominated senior faculty member per department, allowing operational continuity when the Admin is unavailable.
+
+Pivot 9 — GPS Data Consent and Compliance
+Problem: The original design stored GPS coordinates of staff members without explicit consent or a defined data governance process. Under Bangladesh labour norms and the university's own data protection policy, collecting employee location data requires written consent.
+Solution: A GPS Data Consent Form is issued to all faculty before system launch. The profiles table includes gps_consent_signed and gps_consent_date fields. The validation engine checks consent status before reading or storing any GPS payload. Faculty who have not signed consent are validated via campus WiFi IP only. GPS coordinates are encrypted at rest using Supabase's pgcrypto extension and are not exposed in any exported report.
+
+
+6. Pre-Launch Issue Register
+The following issues were identified during the cross-departmental staff review. All HIGH severity items must be resolved before go-live. MEDIUM items must have an owner and resolution plan confirmed before go-live.
+
+Issue
+Severity
+Impact
+Raised By
+GPS inaccuracy inside concrete buildings (40m radius too tight)
+HIGH
+Faculty physically in correct room flagged as absent due to 60-80m GPS drift
+Prof. Karim
+Override PIN window too short for large classes
+HIGH
+5-minute window locks out late-arriving students in 50+ cohorts
+Prof. Alam
+System proves proximity, not that class actually took place
+HIGH
+No audit trail if faculty scan and leave immediately; complaints cannot be investigated
+Mr. Hasan
+Schedule data ownership and update SLA undefined
+HIGH
+Mid-semester reschedules cause valid scans to be rejected until IT manually updates DB
+Prof. Alam
+Flagged scan review process and SLA not defined
+MEDIUM
+Unreviewed flags leave gaps in accreditation records beyond the 48-hour deadline
+Ms. Nadia
+GPS coordinate storage may require staff consent (data compliance)
+MEDIUM
+Risk of employee grievance or legal challenge before system launch
+Ms. Nadia
+No MIS export — dual record-keeping required
+MEDIUM
+Registrar must maintain two separate systems; error-prone and time-consuming
+Ms. Nadia
+No manual fallback when faculty phone battery dies
+LOW
+Faculty have no documented procedure; IT discretion required each time
+Prof. Karim
+Override PIN delegation not supported (admin-only generation)
+LOW
+Unavailable admin creates a single point of failure for ad-hoc class moves
+Prof. Alam
+
+7. Developer Prompt (Revised)
+The following prompt is provided to the AI coding assistant to scaffold and build the system phase-by-phase.
+
+System Role and Context
+You are an expert Full-Stack Web Developer specialising in serverless Jamstack architectures, Progressive Web Apps (PWAs), and secure data validation. You will build a QR-based faculty attendance system for UCSI University Bangladesh. The system must be mobile-first, resilient to GPS drift and WiFi variability, and compliant with university data governance requirements.
+
+Technology Stack
+• Frontend: Next.js (App Router) configured as a PWA with web manifest and service workers. Styling via Tailwind CSS.
+• Backend API: Netlify Functions (serverless Node.js). Functions must handle cold-start constraints and spin down immediately after execution.
+• Database and Auth: Supabase (PostgreSQL with RLS) and Supabase Auth (email OTP only, no magic links).
+• Geofencing: Point-in-polygon validation against building-level polygon coordinates stored in the database. Do not use a fixed-radius Haversine formula.
+
+Execution Instructions
+Do not write any code yet. First, confirm your understanding by producing exactly three items as separate labelled code blocks:
+13. The complete Supabase SQL schema for all six tables (profiles, classrooms, buildings, schedules, attendance_logs, override_pins, flagged_review_queue) with RLS enabled and all constraints defined.
+14. A package.json listing all required dependencies for the Next.js frontend and Netlify Functions.
+15. A /netlify/functions directory structure showing all planned function files and their responsibilities.
+
+After I confirm the schema, proceed phase-by-phase. Before beginning each phase, state which files you will create or modify. Complete each phase fully before starting the next. For every phase, apply these rules:
+• No placeholder comments such as '// TODO' or '// add logic here'. All code must be complete and runnable.
+• All async operations must include try/catch with meaningful error messages returned to the client.
+• All secrets must be read from process.env. Never hardcode credentials or API keys.
+• GPS coordinates in any API payload must be validated as numbers within plausible lat/lng bounds before processing.
+• Any operation that stores GPS data must first confirm gps_consent_signed = true for that user.
+
+Default environment variables to reference throughout:
+• NEXT_PUBLIC_SUPABASE_URL
+• NEXT_PUBLIC_SUPABASE_ANON_KEY
+• SUPABASE_SERVICE_KEY (server-side only, never expose to client)
+• ALLOWED_EMAIL_DOMAIN=ucsi.edu.bd
+• OVERRIDE_PIN_DEFAULT_EXPIRY_MINUTES=10
+• OVERRIDE_PIN_MAX_EXPIRY_MINUTES=30
+• SESSION_CLOSE_TIMEOUT_MINUTES=30
+
+After completing all phases, provide a deployment checklist covering: Supabase RLS verification, Netlify environment variable configuration, PWA manifest validation, GPS consent form distribution, and schedule sync API handoff to the Registrar's office.
+
+
+End of Document — Faculty Attendance System v2.0
+Faculty Attendance System — System Specification v2.0
+
+UCSI University Bangladesh — Confidential	Page 1
+
