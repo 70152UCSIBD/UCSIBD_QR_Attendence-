@@ -2,7 +2,13 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Html5Qrcode, Html5QrcodeScanner } from 'html5-qrcode';
-import { supabase } from '../lib/supabaseClient'; // Adjusted path to lib
+import { supabase } from '../lib/supabaseClient';
+
+const ALLOWED_EMAIL_DOMAIN = process.env.NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN || 'ucsi.edu.bd';
+/** Proxied to `/.netlify/functions/*` via next.config.mjs */
+const FUNCTIONS_BASE = process.env.NEXT_PUBLIC_NETLIFY_FUNCTIONS_BASE || '/netlify/functions';
+const SESSION_CLOSE_MS =
+  (parseInt(process.env.NEXT_PUBLIC_SESSION_CLOSE_MINUTES || '20', 10) || 20) * 60 * 1000;
 
 export default function Home() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -15,10 +21,14 @@ export default function Home() {
   const [scanResult, setScanResult] = useState<string | null>(null);
   const [gpsCoords, setGpsCoords] = useState<{ latitude: number; longitude: number } | null>(null);
   const [cameraPermissionGranted, setCameraPermissionGranted] = useState(false);
+  /** Bumped after each successful scan so the scanner effect re-runs and mounts a new Html5QrcodeScanner. */
+  const [scannerRemountKey, setScannerRemountKey] = useState(0);
   const [showManualEntry, setShowManualEntry] = useState(false);
   const [manualRoomCode, setManualRoomCode] = useState('');
+  const [gpsConsentSigned, setGpsConsentSigned] = useState<boolean | null>(null);
 
   const qrCodeRef = useRef<Html5QrcodeScanner | null>(null);
+  const sessionCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gpsCoordsRef = useRef(gpsCoords);
   useEffect(() => {
     gpsCoordsRef.current = gpsCoords;
@@ -47,29 +57,87 @@ export default function Home() {
     };
   }, []);
 
-  // 2. Geolocation Request
   useEffect(() => {
-    if (isAuthenticated) {
-      if (!navigator.geolocation) {
-        setStatusMessage('Geolocation is not supported by your browser.');
-        return;
-      }
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          setGpsCoords({
-            latitude: position.coords.latitude,
-            longitude: position.coords.longitude,
-          });
-          setStatusMessage('GPS location obtained.');
-        },
-        (error) => {
-          console.error('Geolocation error:', error);
-          setStatusMessage('Failed to get GPS location. Please ensure location services are enabled and permissions granted.');
-        },
-        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-      );
+    if (!isAuthenticated) {
+      setGpsConsentSigned(null);
+      return;
     }
+    let cancelled = false;
+    (async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user || cancelled) return;
+      const { data: profile } = await supabase
+        .from('profiles')
+        .select('gps_consent_signed')
+        .eq('id', user.id)
+        .single();
+      if (!cancelled) {
+        setGpsConsentSigned(profile?.gps_consent_signed ?? false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [isAuthenticated]);
+
+  const clearSessionCloseTimer = useCallback(() => {
+    if (sessionCloseTimerRef.current) {
+      clearTimeout(sessionCloseTimerRef.current);
+      sessionCloseTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleSessionClosePing = useCallback((attendanceLogId: string) => {
+    clearSessionCloseTimer();
+    sessionCloseTimerRef.current = setTimeout(async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) return;
+      try {
+        await fetch(`${FUNCTIONS_BASE}/session-close`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ attendanceLogId, userId: user.id }),
+        });
+      } catch (e) {
+        console.error('Session close ping failed:', e);
+      }
+    }, SESSION_CLOSE_MS);
+  }, [clearSessionCloseTimer]);
+
+  useEffect(() => {
+    return () => clearSessionCloseTimer();
+  }, [clearSessionCloseTimer]);
+
+  // 2. Geolocation — only after v2 GPS consent (WiFi-only validation if declined)
+  useEffect(() => {
+    if (!isAuthenticated || !gpsConsentSigned) {
+      return;
+    }
+    if (!navigator.geolocation) {
+      setStatusMessage('Geolocation is not supported by your browser.');
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setGpsCoords({
+          latitude: position.coords.latitude,
+          longitude: position.coords.longitude,
+        });
+        setStatusMessage('GPS location obtained.');
+      },
+      (error) => {
+        console.error('Geolocation error:', error);
+        setStatusMessage(
+          'Failed to get GPS location. You can still be validated on campus WiFi, or use manual room entry.'
+        );
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  }, [isAuthenticated, gpsConsentSigned]);
 
   const sendAttendanceData = useCallback(async (qrData: string, type: 'qr_scan' | 'manual_entry') => {
     try {
@@ -87,7 +155,7 @@ export default function Home() {
         isManualEntry: type === 'manual_entry',
       };
 
-      const response = await fetch('/netlify/functions/validate-scan', {
+      const response = await fetch(`${FUNCTIONS_BASE}/validate-scan`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -98,6 +166,9 @@ export default function Home() {
       const result = await response.json();
       if (response.ok) {
         setStatusMessage(`Attendance recorded: ${result.message}`);
+        if (typeof result.attendanceLogId === 'string') {
+          scheduleSessionClosePing(result.attendanceLogId);
+        }
       } else {
         setStatusMessage(`Attendance failed: ${result.error || 'Unknown error'}`);
       }
@@ -105,7 +176,7 @@ export default function Home() {
       console.error('Error sending attendance data:', error);
       setStatusMessage(`Error sending attendance data: ${error.message}`);
     }
-  }, []);
+  }, [scheduleSessionClosePing]);
 
   // 3. QR Scanner Initialization
   useEffect(() => {
@@ -122,8 +193,9 @@ export default function Home() {
         setStatusMessage(`QR Scanned: ${decodedText}. Sending attendance...`);
         if (qrCodeRef.current) {
           qrCodeRef.current.clear().catch(error => console.error("Failed to clear scanner", error));
-          qrCodeRef.current = null; // Mark for re-initialization if needed
+          qrCodeRef.current = null;
         }
+        setScannerRemountKey((k) => k + 1);
         await sendAttendanceData(decodedText, 'qr_scan');
       };
 
@@ -155,10 +227,37 @@ export default function Home() {
         qrCodeRef.current = null;
       }
     };
-  }, [isAuthenticated, sendAttendanceData]);
+  }, [isAuthenticated, sendAttendanceData, scannerRemountKey]);
+
+  const handleAcceptGpsConsent = async () => {
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return;
+    setStatusMessage('Saving consent...');
+    const { error } = await supabase
+      .from('profiles')
+      .update({
+        gps_consent_signed: true,
+        gps_consent_date: new Date().toISOString(),
+      })
+      .eq('id', user.id);
+    if (error) {
+      setStatusMessage(`Could not save consent: ${error.message}`);
+      return;
+    }
+    setGpsConsentSigned(true);
+    setStatusMessage('GPS consent saved.');
+  };
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    const domain = ALLOWED_EMAIL_DOMAIN.toLowerCase();
+    const email = emailInput.trim().toLowerCase();
+    if (!email.endsWith(`@${domain}`)) {
+      setStatusMessage(`Only @${domain} university accounts are allowed.`);
+      return;
+    }
     setStatusMessage('Sending OTP...');
     try {
       const { error } = await supabase.auth.signInWithOtp({
@@ -204,6 +303,7 @@ export default function Home() {
 
   const handleLogout = async () => {
     setStatusMessage('Logging out...');
+    clearSessionCloseTimer();
     try {
       const { error } = await supabase.auth.signOut();
       if (error) {
@@ -215,6 +315,7 @@ export default function Home() {
       setQrCodeError('');
       setGpsCoords(null);
       setCameraPermissionGranted(false);
+      setScannerRemountKey(0);
       if (qrCodeRef.current) {
         qrCodeRef.current.clear();
         qrCodeRef.current = null;
@@ -300,6 +401,33 @@ export default function Home() {
             >
               Logout
             </button>
+
+            {gpsConsentSigned === null && (
+              <p className="text-center text-sm text-gray-500">Loading profile…</p>
+            )}
+
+            {gpsConsentSigned === false && (
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 space-y-3" role="region" aria-label="GPS consent">
+                <p className="font-semibold text-amber-900">GPS data consent</p>
+                <p className="text-sm text-amber-900/90">
+                  Under university data governance (v2.0), location may be used for building geofence checks.
+                  Without consent, validation uses campus WiFi only when you scan; GPS coordinates are not stored.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleAcceptGpsConsent}
+                  className="w-full bg-amber-600 text-white py-2.5 rounded-md hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500 focus:ring-offset-2 text-sm font-medium"
+                >
+                  I consent to GPS processing for attendance validation
+                </button>
+              </div>
+            )}
+
+            {gpsConsentSigned === true && (
+              <p className="text-center text-xs text-gray-500">
+                GPS consent on file — location is requested for geofence validation (you may still pass on campus WiFi only).
+              </p>
+            )}
 
             <h2 className="text-2xl font-semibold text-center mt-8 mb-4">Scan Attendance QR</h2>
 

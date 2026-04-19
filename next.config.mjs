@@ -4,6 +4,11 @@ import withPWA from 'next-pwa';
 const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
+  async rewrites() {
+    return [
+      { source: '/netlify/functions/:path*', destination: '/.netlify/functions/:path*' },
+    ];
+  },
 };
 
 const pwaConfig = withPWA({

@@ -1,0 +1,8 @@
+# Netlify + Next.js — see https://docs.netlify.com/frameworks/next-js/overview/
+[build]
+  command = "npm run build"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# Functions live at /.netlify/functions/<name> (rewritten from /netlify/functions/* in next.config.mjs)
