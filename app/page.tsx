@@ -1,7 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from 'react';
-import { Html5QrcodeScanner } from 'html5-qrcode';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { Html5Qrcode, Html5QrcodeScanner } from 'html5-qrcode';
 import { supabase } from '../lib/supabaseClient'; // Adjusted path to lib
 
 export default function Home() {
@@ -19,6 +19,10 @@ export default function Home() {
   const [manualRoomCode, setManualRoomCode] = useState('');
 
   const qrCodeRef = useRef<Html5QrcodeScanner | null>(null);
+  const gpsCoordsRef = useRef(gpsCoords);
+  useEffect(() => {
+    gpsCoordsRef.current = gpsCoords;
+  }, [gpsCoords]);
 
   // 1. Supabase Auth Listener
   useEffect(() => {
@@ -67,6 +71,42 @@ export default function Home() {
     }
   }, [isAuthenticated]);
 
+  const sendAttendanceData = useCallback(async (qrData: string, type: 'qr_scan' | 'manual_entry') => {
+    try {
+      const user = await supabase.auth.getUser();
+      if (!user.data.user) {
+        setStatusMessage('Authentication required to send attendance.');
+        return;
+      }
+
+      const payload = {
+        qrToken: qrData,
+        gpsData: gpsCoordsRef.current,
+        userId: user.data.user.id,
+        timestamp: new Date().toISOString(),
+        isManualEntry: type === 'manual_entry',
+      };
+
+      const response = await fetch('/netlify/functions/validate-scan', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(payload),
+      });
+
+      const result = await response.json();
+      if (response.ok) {
+        setStatusMessage(`Attendance recorded: ${result.message}`);
+      } else {
+        setStatusMessage(`Attendance failed: ${result.error || 'Unknown error'}`);
+      }
+    } catch (error: any) {
+      console.error('Error sending attendance data:', error);
+      setStatusMessage(`Error sending attendance data: ${error.message}`);
+    }
+  }, []);
+
   // 3. QR Scanner Initialization
   useEffect(() => {
     if (isAuthenticated && !qrCodeRef.current) {
@@ -91,8 +131,8 @@ export default function Home() {
         setQrCodeError(`QR Scan Error: ${error}`);
       };
 
-      // Request camera permission explicitly before starting the scanner
-      Html5QrcodeScanner.getCameras()
+      // Request camera permission explicitly before starting the scanner (API lives on Html5Qrcode, not Html5QrcodeScanner)
+      Html5Qrcode.getCameras()
         .then(cameras => {
           if (cameras && cameras.length) {
             setCameraPermissionGranted(true);
@@ -115,7 +155,7 @@ export default function Home() {
         qrCodeRef.current = null;
       }
     };
-  }, [isAuthenticated]);
+  }, [isAuthenticated, sendAttendanceData]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -183,42 +223,6 @@ export default function Home() {
     } catch (error: any) {
       console.error('Logout error:', error.message);
       setStatusMessage(`Logout failed: ${error.message}`);
-    }
-  };
-
-  const sendAttendanceData = async (qrData: string, type: 'qr_scan' | 'manual_entry') => {
-    try {
-      const user = await supabase.auth.getUser();
-      if (!user.data.user) {
-        setStatusMessage('Authentication required to send attendance.');
-        return;
-      }
-
-      const payload = {
-        qrToken: qrData,
-        gpsData: gpsCoords, // Can be null if consent not given or not available
-        userId: user.data.user.id,
-        timestamp: new Date().toISOString(),
-        isManualEntry: type === 'manual_entry',
-      };
-
-      const response = await fetch('/netlify/functions/validate-scan', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(payload),
-      });
-
-      const result = await response.json();
-      if (response.ok) {
-        setStatusMessage(`Attendance recorded: ${result.message}`);
-      } else {
-        setStatusMessage(`Attendance failed: ${result.error || 'Unknown error'}`);
-      }
-    } catch (error: any) {
-      console.error('Error sending attendance data:', error);
-      setStatusMessage(`Error sending attendance data: ${error.message}`);
     }
   };
 
